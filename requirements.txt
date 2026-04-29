@@ -1,0 +1,11 @@
+ultralytics>=8.3.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pyyaml>=6.0
+torch>=2.0.0                        # required by facial-emotion-recognition
+torchvision>=0.15.0                 # required by facial-emotion-recognition
+facial-emotion-recognition>=0.3.4   # bundled 33MB model, offline, 95.6% acc
+# Optional:
+# pyaudio>=0.2.13      # microphone-based cry detection
+# requests>=2.31.0     # Telegram notifications
+# torch>=2.0.0         # GPU acceleration (CUDA)

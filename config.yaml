@@ -1,0 +1,91 @@
+# ============================================================
+# Baby Monitor - Child Safety Monitor Config
+# ============================================================
+
+source:
+  type: "webcam"          # webcam | rtsp | file
+  device_id: 0
+  rtsp_url: ""
+  file_path: "/Users/pirnazarov19941406icloud.com/Desktop/Belissimo data/CV_tasks/datasets/IMG_1023.MOV"
+
+output:
+  show_video: true
+  save_video: false
+  output_path: "output/recorded.mp4"
+  fps: 25
+  resolution: [1280, 720]
+
+model:
+  weights: "yolo11n-pose.pt"   # yolo11n-pose | yolo11s-pose | yolo11m-pose
+  confidence: 0.45
+  iou: 0.65
+  dedup_iou: 0.45
+  device: "auto"
+  imgsz: 640
+
+classes:
+  person_class_id: 0
+
+emotion:
+  enabled: true
+  cry_emotions: ["Sad", "Fear", "Angry", "Disgust"]
+  min_confidence: 0.40
+  run_every_n_frames: 5
+
+pose:
+  enabled: true
+  distress_score_threshold: 0.4
+
+# --- Inappropriate touch detection ---
+touch:
+  enabled: true
+  # Alert thresholds (seconds of wrist-inside-child-bbox contact)
+  warn_seconds: 3.0           # TOUCH_WARN      head / sensitive zone
+  alert_seconds: 5.0          # TOUCH_ALERT     chest / groin (private)
+  emergency_seconds: 10.0     # TOUCH_EMERGENCY private zone + child distress
+  event_gap_seconds: 2.0      # max gap before timer resets
+  alert_cooldown_seconds: 30.0
+  # How far inside bbox edges the wrist must be (fraction of bbox size)
+  # Prevents false positives from passing-by motions
+  edge_margin: 0.05
+
+alone:
+  adult_height_ratio: 0.50
+  child_height_ratio: 0.40
+  use_size_filter: true
+  tracker_max_dist_ratio: 0.15
+  tracker_max_miss: 5
+
+alerts:
+  alone_window_seconds: 240
+  cry_window_seconds: 240
+  cry_ratio_threshold: 0.70
+  alert_cooldown_seconds: 60
+
+audio:
+  enabled: false
+  sample_rate: 16000
+  chunk_size: 1024
+  cry_frequency_min: 300
+  cry_frequency_max: 1000
+  cry_amplitude_threshold: 0.3
+
+notification:
+  console: true
+  sound_alert: true
+  telegram:
+    enabled: false
+    bot_token: "YOUR_BOT_TOKEN"
+    chat_id: "YOUR_CHAT_ID"
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    sender: "your@email.com"
+    password: "your_app_password"
+    recipient: "recipient@email.com"
+
+logging:
+  level: "INFO"
+  file: "logs/monitor.log"
+  max_size_mb: 10

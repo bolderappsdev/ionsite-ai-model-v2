@@ -1,0 +1,38 @@
+model:
+  base: "yolo11n.pt"    # yolo11n | yolo11s | yolo11m | yolo11l | yolo11x
+
+dataset:
+  path: "training/data"
+  train_dir: "images/train"
+  val_dir: "images/val"
+  test_dir: "images/test"
+  class_names:
+    - child    # 0
+    - adult    # 1
+
+training:
+  epochs: 100
+  imgsz: 640
+  batch: 16
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  patience: 50
+  save_period: 10
+  optimizer: "SGD"
+  augment: true
+  device: "auto"
+  workers: 4
+  seed: 42
+  project: "training/runs"
+  name: "baby_monitor_v1"
+
+export:
+  enabled: false
+  format: "onnx"
+
+# Label format (YOLO, normalized 0-1):
+#   <class_id> <x_center> <y_center> <width> <height>
+# Labeling tools: Roboflow, CVAT, LabelImg
