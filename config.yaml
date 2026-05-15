@@ -7,6 +7,9 @@ source:
   device_id: 0
   rtsp_url: ""
   file_path: "/Users/pirnazarov19941406icloud.com/Desktop/Belissimo data/CV_tasks/datasets/IMG_1023.MOV"
+  # UUID matching an apps/backend Camera.id in IONSITE.
+  # Required when notification.ionsite.enabled = true.
+  camera_id: ""
 
 output:
   show_video: true
@@ -84,6 +87,15 @@ notification:
     sender: "your@email.com"
     password: "your_app_password"
     recipient: "recipient@email.com"
+  ionsite:
+    enabled: false                                           # turn on per environment
+    url: "http://localhost:3000/api/alert/ingest"
+    health_url: "http://localhost:3000/api/alert/ingest/health"
+    service_key: ""                                          # = AI_SERVICE_API_KEY in backend .env
+    timeout_seconds: 10
+    pre_alert_seconds: 5                                     # pre-alert frame buffer length
+    post_alert_seconds: 3                                    # frames captured after alert
+    clip_fps: 25                                             # mp4 fps for the alert clip
 
 logging:
   level: "INFO"

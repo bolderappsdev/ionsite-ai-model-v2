@@ -36,11 +36,16 @@ import time
 import logging
 import sys
 import threading
+import os
+import json
+import uuid
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Any
 
 import yaml
 import numpy as np
@@ -606,11 +611,31 @@ class AudioCryDetector:
 
 
 # ─────────────────────────────────────────────────────────────
+# v2 alert string → IONSITE (alertType, severity) mapping
+# AlertType enum on the web side is AGGRESSION | TOUCHING | NEGLECT.
+# AGGRESSION is intentionally absent — v2 doesn't emit it yet.
+# ─────────────────────────────────────────────────────────────
+_IONSITE_ALERT_MAP: Dict[str, Tuple[str, str]] = {
+    "ALONE_4MIN":        ("NEGLECT",  "HIGH"),
+    "CRYING_70PCT_4MIN": ("NEGLECT",  "HIGH"),
+    "TOUCH_WARN":        ("TOUCHING", "LOW"),
+    "TOUCH_ALERT":       ("TOUCHING", "MEDIUM"),
+    "TOUCH_EMERGENCY":   ("TOUCHING", "HIGH"),
+}
+
+
+# ─────────────────────────────────────────────────────────────
 # Notifier
 # ─────────────────────────────────────────────────────────────
 class Notifier:
     def __init__(self, cfg, logger):
         self.cfg = cfg.get("notification", {}); self.logger = logger
+        self._executor: Optional[ThreadPoolExecutor] = None
+        ic = self.cfg.get("ionsite", {})
+        if ic.get("enabled") and REQUESTS_AVAILABLE:
+            self._executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="ionsite"
+            )
 
     def send(self, atype, msg):
         if self.cfg.get("console", True):
@@ -632,6 +657,161 @@ class Notifier:
                 with smtplib.SMTP(em["smtp_server"],em["smtp_port"]) as s:
                     s.starttls(); s.login(em["sender"],em["password"]); s.send_message(m)
             except Exception: pass
+
+    def ingest_health_probe(self) -> None:
+        """One-shot startup check against IONSITE's /api/alert/ingest/health.
+        Logs ok or warning. Never raises — misconfiguration shouldn't block startup."""
+        ic = self.cfg.get("ionsite", {})
+        if not ic.get("enabled"):
+            return
+        if not REQUESTS_AVAILABLE:
+            self.logger.warning(
+                "IONSITE ingest enabled but `requests` not installed."
+            )
+            return
+        url = ic.get("health_url", "")
+        if not url:
+            self.logger.warning("IONSITE ingest enabled but health_url unset.")
+            return
+        try:
+            r = req.get(
+                url,
+                headers={"X-Service-Key": ic.get("service_key", "")},
+                timeout=ic.get("timeout_seconds", 10),
+            )
+            if 200 <= r.status_code < 300:
+                self.logger.info(f"IONSITE ingest reachable ({url})")
+            else:
+                self.logger.warning(
+                    f"IONSITE ingest unreachable: HTTP {r.status_code} "
+                    f"body={r.text[:200]}"
+                )
+        except Exception as e:
+            self.logger.warning(f"IONSITE ingest unreachable: {e}")
+
+    def dispatch_alert(self, envelope: Dict[str, Any], clip_path: str) -> None:
+        """Submit alert + clip to IONSITE in a background thread. Best-effort
+        (no retries) — the AI-side cooldown plus subsequent alerts will pick up
+        anything missed by a transient failure."""
+        ic = self.cfg.get("ionsite", {})
+        if not ic.get("enabled") or not REQUESTS_AVAILABLE:
+            self._unlink(clip_path)
+            return
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="ionsite"
+            )
+        self._executor.submit(self._send_ionsite, ic, envelope, clip_path)
+
+    def _send_ionsite(self, ic: Dict[str, Any], envelope: Dict[str, Any], clip_path: str) -> None:
+        try:
+            metadata = {
+                "cameraId":    envelope["cameraId"],
+                "alertType":   envelope["alertType"],
+                "severity":    envelope["severity"],
+                "confidence":  envelope["confidence"],
+                "description": envelope["description"],
+            }
+            # Deterministic Idempotency-Key: retries within the same second of
+            # the same camera+atype collapse onto the same response server-side.
+            idem = uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{envelope['cameraId']}|{envelope['atype']}|{int(envelope['timestamp'])}",
+            )
+            with open(clip_path, "rb") as fh:
+                files = {
+                    "metadata": (None, json.dumps(metadata), "application/json"),
+                    "clip":     ("clip.mp4", fh, "video/mp4"),
+                }
+                r = req.post(
+                    ic["url"],
+                    headers={
+                        "X-Service-Key":   ic.get("service_key", ""),
+                        "Idempotency-Key": str(idem),
+                    },
+                    files=files,
+                    timeout=ic.get("timeout_seconds", 10),
+                )
+            if 200 <= r.status_code < 300:
+                self.logger.info(
+                    f"IONSITE ingest ok: {envelope['atype']} → "
+                    f"{envelope['alertType']}/{envelope['severity']} "
+                    f"(conf={envelope['confidence']})"
+                )
+            else:
+                self.logger.warning(
+                    f"IONSITE ingest failed: HTTP {r.status_code} "
+                    f"body={r.text[:200]}"
+                )
+        except Exception as e:
+            self.logger.warning(f"IONSITE ingest exception: {e}")
+        finally:
+            self._unlink(clip_path)
+
+    @staticmethod
+    def _unlink(path: str) -> None:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Pre/post-alert frame buffer + clip mux
+# ─────────────────────────────────────────────────────────────
+class PreAlertBuffer:
+    """Ring of (timestamp, BGR-frame-copy) entries. Used to build the pre-roll
+    portion of the alert clip; sized for pre_alert_seconds * clip_fps."""
+    def __init__(self, max_frames: int) -> None:
+        self._buf: deque = deque(maxlen=max(1, max_frames))
+
+    def append(self, ts: float, frame) -> None:
+        if frame is not None:
+            self._buf.append((ts, frame.copy()))
+
+    def snapshot(self) -> List[Any]:
+        return [f for (_, f) in self._buf]
+
+
+@dataclass
+class _PendingClipState:
+    envelope: Dict[str, Any]
+    pre_frames: List[Any]
+    post_frames: List[Any] = field(default_factory=list)
+    deadline: float = 0.0
+    target_post_frames: int = 0
+
+
+def _mux_clip(pending: _PendingClipState, fps: int) -> str:
+    """Write pre+post frames into a temp mp4 using H.264 (avc1) so the browser's
+    <video> element can play it. OpenCV's Mac wheel uses VideoToolbox under the
+    hood for avc1; on Linux it falls back to whatever the system has. We try
+    avc1 first and fall back to mp4v only if the writer fails to open — that
+    fallback won't play in browsers but at least the alert file is preserved.
+    """
+    all_frames = pending.pre_frames + pending.post_frames
+    if not all_frames:
+        raise RuntimeError("no frames to mux")
+    h, w = all_frames[0].shape[:2]
+    fd, path = tempfile.mkstemp(suffix=".mp4", prefix="ionsite-alert-")
+    os.close(fd)
+
+    writer = cv2.VideoWriter(
+        path, cv2.VideoWriter_fourcc(*"avc1"), fps, (w, h),
+    )
+    if not writer.isOpened():
+        writer = cv2.VideoWriter(
+            path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h),
+        )
+
+    try:
+        for f in all_frames:
+            if f.shape[:2] != (h, w):
+                f = cv2.resize(f, (w, h))
+            writer.write(f)
+    finally:
+        writer.release()
+    return path
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1065,6 +1245,18 @@ class BabyMonitor:
         if oc.get("save_video"):
             Path(oc["output_path"]).parent.mkdir(parents=True, exist_ok=True)
 
+        # ── IONSITE ingest plumbing ──────────────────────────
+        ic = self.cfg.get("notification", {}).get("ionsite", {})
+        self._clip_fps: int = int(ic.get("clip_fps", oc.get("fps", 25)))
+        pre_seconds: float = float(ic.get("pre_alert_seconds", 5))
+        post_seconds: float = float(ic.get("post_alert_seconds", 3))
+        self._prealert_buf = PreAlertBuffer(int(pre_seconds * self._clip_fps))
+        self._post_seconds: float = post_seconds
+        self._post_target: int = int(post_seconds * self._clip_fps)
+        self._pending_clips: List[_PendingClipState] = []
+
+        self.notifier.ingest_health_probe()
+
         self.logger.info("Baby Monitor ready.")
 
     def _open_source(self):
@@ -1177,11 +1369,73 @@ class BabyMonitor:
 
         return is_crying, face_score, pose_score, motion_score, combined, emotions
 
-    def _alert(self, atype, msg):
+    def _alert(self, atype, msg, confidence_score: float = 0.0, current_frame=None):
         now = time.time()
         if now - self.state.last_alert_time < self.cooldown: return
         self.state.last_alert_time = now; self.state.alert_count += 1
         self.notifier.send(atype, msg)
+        self._queue_ionsite_clip(atype, msg, confidence_score, current_frame, now)
+
+    def _queue_ionsite_clip(self, atype, msg, confidence_score, current_frame, now) -> None:
+        """If IONSITE ingest is enabled, build an envelope + queue a pending clip
+        capture. The main loop will fill in post-alert frames and dispatch when
+        the buffer is full."""
+        ic = self.cfg.get("notification", {}).get("ionsite", {})
+        if not ic.get("enabled"):
+            return
+        camera_id = self.cfg.get("source", {}).get("camera_id", "")
+        if not camera_id:
+            self.logger.warning(
+                "IONSITE alert skipped: source.camera_id not set in config."
+            )
+            return
+        if atype not in _IONSITE_ALERT_MAP:
+            self.logger.warning(
+                f"IONSITE alert skipped: no mapping for '{atype}'."
+            )
+            return
+        alert_type, severity = _IONSITE_ALERT_MAP[atype]
+        confidence_int = max(0, min(100, int(round(float(confidence_score) * 100))))
+        envelope = {
+            "cameraId":    camera_id,
+            "atype":       atype,
+            "alertType":   alert_type,
+            "severity":    severity,
+            "confidence":  confidence_int,
+            "description": msg,
+            "timestamp":   now,
+        }
+        pre_frames = self._prealert_buf.snapshot()
+        # If we have no pre-frames yet (first seconds of run), seed with the
+        # current frame so the clip is never empty.
+        if not pre_frames and current_frame is not None:
+            pre_frames = [current_frame.copy()]
+        self._pending_clips.append(_PendingClipState(
+            envelope=envelope,
+            pre_frames=pre_frames,
+            deadline=now + self._post_seconds,
+            target_post_frames=self._post_target,
+        ))
+
+    def _process_pending_clips(self, now: float, frame) -> None:
+        """Per-frame: append to each pending clip's post-buffer; once full
+        (or deadline passed), mux to mp4 and hand to the Notifier."""
+        if not self._pending_clips:
+            return
+        for pending in list(self._pending_clips):
+            if (len(pending.post_frames) < pending.target_post_frames
+                    and now <= pending.deadline
+                    and frame is not None):
+                pending.post_frames.append(frame.copy())
+            if (len(pending.post_frames) >= pending.target_post_frames
+                    or now > pending.deadline):
+                self._pending_clips.remove(pending)
+                try:
+                    clip_path = _mux_clip(pending, self._clip_fps)
+                except Exception as e:
+                    self.logger.warning(f"IONSITE clip mux failed: {e}")
+                    continue
+                self.notifier.dispatch_alert(pending.envelope, clip_path)
 
     @staticmethod
     def _draw_skeleton(frame, kps, color=(0,220,220)):
@@ -1420,6 +1674,11 @@ class BabyMonitor:
                 h, w = frame.shape[:2]
                 now  = time.time()
 
+                # IONSITE clip plumbing — pre-roll ring buffer + drain any
+                # post-roll captures from a recent alert.
+                self._prealert_buf.append(now, frame)
+                self._process_pending_clips(now, frame)
+
                 # YOLO inference
                 res = self.model.predict(
                     frame,
@@ -1476,7 +1735,7 @@ class BabyMonitor:
                         TouchAlertState.EMERGENCY_ALERT:
                             f"EMERGENCY: Prolonged touch + distress! Zone:{zone_info} {dur_info}",
                     }
-                    self._alert(ta, msgs.get(ta, ta))
+                    self._alert(ta, msgs.get(ta, ta), touch_score, frame)
 
                 # Alone timer + alerts
                 asec = 0.0
@@ -1488,14 +1747,16 @@ class BabyMonitor:
 
                     if asec >= self.alone_window:
                         self._alert(AlertState.ALONE_ALERT,
-                            f"Child ALONE for {timedelta(seconds=int(asec))}!")
+                            f"Child ALONE for {timedelta(seconds=int(asec))}!",
+                            1.0, frame)
 
                     if (self.cry_tracker.window_filled(now)
                             and cry_ratio >= self.cry_ratio_thresh):
                         self._alert(AlertState.CRY_ALERT,
                             f"EMERGENCY: Child crying {cry_ratio:.0%} of last "
                             f"{self.cry_window//60} min! "
-                            f"({', '.join(pose_signals) or 'FER/motion'})")
+                            f"({', '.join(pose_signals) or 'FER/motion'})",
+                            cry_ratio, frame)
                 else:
                     if self.state.alone_start is not None:
                         elapsed = now - self.state.alone_start
