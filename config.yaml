@@ -1,12 +1,12 @@
 # ============================================================
-# Baby Monitor - Child Safety Monitor Config
+# Baby Monitor - Child Distress & Safety Monitor Config
 # ============================================================
 
 source:
   type: "webcam"          # webcam | rtsp | file
   device_id: 0
   rtsp_url: ""
-  file_path: "/Users/pirnazarov19941406icloud.com/Desktop/Belissimo data/CV_tasks/datasets/IMG_1023.MOV"
+  file_path: ""
 
 output:
   show_video: true
@@ -26,27 +26,78 @@ model:
 classes:
   person_class_id: 0
 
+# ─────────────────────────────────────────────────────────────
+# EMOTION — Facial Emotion Recognition
+# ─────────────────────────────────────────────────────────────
+# 7 ta emotion: Angry, Disgust, Fear, Happy, Sad, Surprise, Neutral.
+# cry_emotions = DISTRESS sifatida hisoblanadigan emotionlar:
+#   Sad     → yig'lash
+#   Fear    → qo'rqish
+#   Angry   → g'azab / isteriya
+#   Disgust → jirkanish / og'riq
 emotion:
   enabled: true
   cry_emotions: ["Sad", "Fear", "Angry", "Disgust"]
   min_confidence: 0.40
-  run_every_n_frames: 5
+  run_every_n_frames: 2      # FIX: eski 5 → 2 (yaxshiroq responsiveness)
 
+# ─────────────────────────────────────────────────────────────
+# POSE — Body language distress
+# ─────────────────────────────────────────────────────────────
+# 5 ta signal:
+#   arms_raised — qo'l yelka ustida (qo'rqish, himoya)
+#   torso_curl  — bosh yelka pastida (yig'lash, gavda burishish)
+#   head_droop  — bosh osilgan (yig'lash, og'riq, charchoq)
+#   lying_down  — gorizontal pozitsiya (yiqilgan / yotgan)
+#   body_shake  — tez tebranish (isteriya, og'ir yig'lash)
 pose:
   enabled: true
   distress_score_threshold: 0.4
 
-# --- Inappropriate touch detection ---
+# ─────────────────────────────────────────────────────────────
+# AUDIO — FFT cry detection (mikrofon)
+# ─────────────────────────────────────────────────────────────
+# Bola yig'i odatda 300-1000 Hz oralig'ida bo'ladi.
+# Endi cry_score (soft 0..1) TO'LIQ combined logikaga qo'shiladi.
+audio:
+  enabled: true                  # mikrofondan foydalanish
+  sample_rate: 16000
+  chunk_size: 1024
+  cry_frequency_min: 300         # Hz
+  cry_frequency_max: 1000        # Hz
+  cry_amplitude_threshold: 0.3   # minimal volume (0..1)
+
+# ─────────────────────────────────────────────────────────────
+# FUSION — Multi-modal distress detection vaznlari
+# ─────────────────────────────────────────────────────────────
+# combined = face*w_face + audio*w_audio + pose*w_pose + motion*w_motion
+#
+# is_distress agar:
+#   combined >= combined_threshold      (umumiy o'rtacha yuqori)
+#   YOKI 2+ ta signal >= strong_signal_threshold
+#   YOKI bittasi >= very_strong_threshold
+#
+# Agar audio o'chirilgan bo'lsa, audio_weight motion ga avtomatik o'tadi.
+fusion:
+  face_weight: 0.40              # FER — eng ishonchli (training data 95%)
+  audio_weight: 0.35             # Audio FFT — direktan cry signal
+  pose_weight: 0.20              # Pose — supporting signal
+  motion_weight: 0.05            # Motion — eng oxirgi chora
+
+  combined_threshold: 0.45       # weighted average distress threshold
+  strong_signal_threshold: 0.55  # bitta signal "kuchli" bo'lishi uchun
+  very_strong_threshold: 0.70    # bitta signal o'zi yetarli bo'lishi uchun
+
+# ─────────────────────────────────────────────────────────────
+# Inappropriate touch detection
+# ─────────────────────────────────────────────────────────────
 touch:
   enabled: true
-  # Alert thresholds (seconds of wrist-inside-child-bbox contact)
   warn_seconds: 3.0           # TOUCH_WARN      head / sensitive zone
   alert_seconds: 5.0          # TOUCH_ALERT     chest / groin (private)
-  emergency_seconds: 10.0     # TOUCH_EMERGENCY private zone + child distress
-  event_gap_seconds: 2.0      # max gap before timer resets
+  emergency_seconds: 10.0     # TOUCH_EMERGENCY private + distress
+  event_gap_seconds: 2.0
   alert_cooldown_seconds: 30.0
-  # How far inside bbox edges the wrist must be (fraction of bbox size)
-  # Prevents false positives from passing-by motions
   edge_margin: 0.05
 
 alone:
@@ -61,14 +112,6 @@ alerts:
   cry_window_seconds: 240
   cry_ratio_threshold: 0.70
   alert_cooldown_seconds: 60
-
-audio:
-  enabled: false
-  sample_rate: 16000
-  chunk_size: 1024
-  cry_frequency_min: 300
-  cry_frequency_max: 1000
-  cry_amplitude_threshold: 0.3
 
 notification:
   console: true
